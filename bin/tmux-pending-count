@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# tmux-pending-count — Status bar widget showing Claude sessions needing attention
+# Counts sessions with at least one pane in @claude_status=WAITING.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/tmux-cc-status"
+
+count=0
+while IFS= read -r session; do
+    status=$(cc_status_for_session "$session")
+    [[ "$status" == "WAITING" ]] && ((count++))
+done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+# Stale-state cleanup
+cc_cleanup_stale
+
+if [[ $count -gt 0 ]]; then
+    printf '\uf0f3 %d\n' "$count"
+fi

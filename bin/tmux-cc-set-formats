@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# tmux-cc-set-formats — Set window status formats with Claude status icons
+# Called via run-shell from tmux-workflow.conf
+
+BELL=$(printf '\uf0f3')
+COG=$(printf '\uf013')
+CHECK=$(printf '\uf00c')
+
+# Conditional icon: shows icon+space before window name for claude panes
+ICON="#{?#{==:#{@claude_status},WAITING},${BELL} ,#{?#{==:#{@claude_status},WORKING},${COG} ,#{?#{==:#{@claude_status},IDLE},${CHECK} ,}}}"
+
+# Add padding after session name (before window list)
+current_left=$(tmux show -gv status-left 2>/dev/null)
+tmux set -g status-left "${current_left}  "
+
+tmux set -g window-status-format "#[fg=#c4a7e7,bg=default]#I#[fg=#c4a7e7,bg=default] > #[fg=#c4a7e7,bg=default]${ICON}#W"
+tmux set -g window-status-current-format "#[fg=#f6c177,bg=default]#I#[fg=#f6c177,bg=default] > #[fg=#f6c177,bg=default]${ICON}#W"

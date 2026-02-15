@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# tmux-dashboard — TUI dashboard for monitoring Claude Code across tmux sessions
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/tmux-cc-status"
+
+# ── Config ──────────────────────────────────────────────────────────────────
+REFRESH_INTERVAL=1  # seconds between auto-refresh
+PREVIEW_LINES=5
+SHOW_PREVIEW=true
+
+# Rose Pine colors (true color)
+COLOR_LOVE=$'\e[38;2;235;111;146m'    # #eb6f92 — WAITING
+COLOR_GOLD=$'\e[38;2;246;193;119m'    # #f6c177 — WORKING
+COLOR_PINE=$'\e[38;2;49;116;143m'     # #31748f — IDLE
+COLOR_SUBTLE=$'\e[38;2;144;140;170m'  # #908caa — SHELL
+COLOR_TEXT=$'\e[38;2;224;222;244m'     # #e0def4 — text
+COLOR_MUTED=$'\e[38;2;110;106;134m'   # #6e6a86 — muted
+COLOR_BASE=$'\e[38;2;25;23;36m'       # #191724 — base
+COLOR_SURFACE=$'\e[38;2;31;29;46m'    # #1f1d2e — surface
+COLOR_HIGHLIGHT=$'\e[48;2;38;35;58m'  # #26233a — highlight (bg)
+BOLD=$'\e[1m'
+DIM=$'\e[2m'
+RESET=$'\e[0m'
+
+# ── State ───────────────────────────────────────────────────────────────────
+declare -a S_NAMES=() S_STATUS=() S_COUNT=() S_CMD=() S_BEST_PANE=()
+CURSOR=0
+PREV_RENDER=""
+TERM_ROWS=0
+TERM_COLS=0
+
+# ── Terminal setup / teardown ───────────────────────────────────────────────
+setup_terminal() {
+    tput smcup       # alternate screen
+    tput civis       # hide cursor
+    stty -echo -icanon min 0 time 0
+    printf '\e[?25l' # belt-and-suspenders cursor hide
+}
+
+cleanup() {
+    tput cnorm 2>/dev/null       # show cursor
+    tput rmcup 2>/dev/null       # restore screen
+    stty sane 2>/dev/null
+    printf '\e[?25h' 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+update_dimensions() {
+    TERM_ROWS=$(tput lines)
+    TERM_COLS=$(tput cols)
+}
+
+handle_winch() {
+    update_dimensions
+    PREV_RENDER=""  # force full redraw
+}
+trap handle_winch WINCH
+
+# ── Data gathering ──────────────────────────────────────────────────────────
+status_priority() {
+    case "$1" in
+        WAITING) echo 0 ;;
+        WORKING) echo 1 ;;
+        IDLE)    echo 2 ;;
+        *)       echo 3 ;;
+    esac
+}
+
+gather_sessions() {
+    S_NAMES=() S_STATUS=() S_COUNT=() S_CMD=() S_BEST_PANE=()
+
+    local -a tmp_names=() tmp_status=() tmp_count=() tmp_cmd=() tmp_best=() tmp_prio=()
+
+    while IFS= read -r sname; do
+        [[ -z "$sname" ]] && continue
+        local st ct bp
+        st=$(cc_status_for_session "$sname")
+        ct=$(cc_instance_count "$sname")
+        bp=$(cc_best_pane "$sname")
+
+        # Active command: from best pane or first pane
+        local target_pane="${bp:-}"
+        if [[ -z "$target_pane" ]]; then
+            target_pane=$(tmux list-panes -t "$sname" -F '#{pane_id}' 2>/dev/null | head -1)
+        fi
+        local cmd=""
+        if [[ -n "$target_pane" ]]; then
+            cmd=$(tmux display-message -t "$target_pane" -p '#{pane_current_command}' 2>/dev/null || true)
+        fi
+
+        tmp_names+=("$sname")
+        tmp_status+=("$st")
+        tmp_count+=("$ct")
+        tmp_cmd+=("$cmd")
+        tmp_best+=("$bp")
+        tmp_prio+=("$(status_priority "$st")")
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+    # Sort by priority
+    local n=${#tmp_names[@]}
+    if ((n == 0)); then return; fi
+
+    local -a indices=()
+    for ((i=0; i<n; i++)); do indices+=("$i"); done
+
+    # Simple insertion sort (n is small)
+    for ((i=1; i<n; i++)); do
+        local key=${indices[$i]}
+        local j=$((i - 1))
+        while ((j >= 0)) && ((tmp_prio[indices[j]] > tmp_prio[key])); do
+            indices[$((j+1))]=${indices[$j]}
+            ((j--))
+        done
+        indices[$((j+1))]=$key
+    done
+
+    for ((i=0; i<n; i++)); do
+        local idx=${indices[$i]}
+        S_NAMES+=("${tmp_names[$idx]}")
+        S_STATUS+=("${tmp_status[$idx]}")
+        S_COUNT+=("${tmp_count[$idx]}")
+        S_CMD+=("${tmp_cmd[$idx]}")
+        S_BEST_PANE+=("${tmp_best[$idx]}")
+    done
+}
+
+# ── Rendering ───────────────────────────────────────────────────────────────
+move_to() { printf '\e[%d;%dH' "$1" "$2"; }
+clear_eol() { printf '\e[K'; }
+
+color_for_status() {
+    case "$1" in
+        WAITING) printf '%s' "$COLOR_LOVE" ;;
+        WORKING) printf '%s' "$COLOR_GOLD" ;;
+        IDLE)    printf '%s' "$COLOR_PINE" ;;
+        *)       printf '%s' "$COLOR_SUBTLE" ;;
+    esac
+}
+
+status_label() {
+    case "$1" in
+        WAITING) printf 'WAITING' ;;
+        WORKING) printf 'WORKING' ;;
+        IDLE)    printf 'IDLE' ;;
+        *)       printf 'SHELL' ;;
+    esac
+}
+
+render_header() {
+    local waiting_count=0
+    for st in "${S_STATUS[@]}"; do
+        [[ "$st" == "WAITING" ]] && ((waiting_count++))
+    done
+
+    local n=${#S_NAMES[@]}
+    local time_str
+    time_str=$(date +%H:%M)
+
+    move_to 1 1
+    # Title line
+    local title=" Claude Code Dashboard"
+    printf '%s%s%s' "$BOLD" "$COLOR_TEXT" "$title"
+
+    local right_info=""
+    if ((waiting_count > 0)); then
+        right_info="${COLOR_LOVE}${BOLD} ${waiting_count} WAITING${RESET}  ${COLOR_MUTED}${n} sessions  ${time_str}${RESET}"
+    else
+        right_info="${COLOR_MUTED}${n} sessions  ${time_str}${RESET}"
+    fi
+
+    # Right-align: move to right side
+    # Approximate length for positioning (strip escape codes for length calc)
+    local right_plain
+    if ((waiting_count > 0)); then
+        right_plain=" ${waiting_count} WAITING  ${n} sessions  ${time_str}"
+    else
+        right_plain="${n} sessions  ${time_str}"
+    fi
+    local pad=$((TERM_COLS - ${#title} - ${#right_plain} - 2))
+    ((pad > 0)) && printf '%*s' "$pad" ""
+    printf '%s' "$right_info"
+    printf '%s' "$RESET"
+    clear_eol
+
+    # Separator
+    move_to 2 1
+    printf '%s' "$COLOR_MUTED"
+    printf '%.0s─' $(seq 1 "$TERM_COLS")
+
+    # Column headers
+    move_to 3 1
+    printf '%s%s  #  %-30s %-12s %3s  %-10s%s' "$BOLD" "$COLOR_MUTED" "Session" "Status" "CC" "Activity" "$RESET"
+    clear_eol
+
+    move_to 4 1
+    printf '%s' "$COLOR_MUTED"
+    printf '%.0s─' $(seq 1 "$TERM_COLS")
+}
+
+render_table() {
+    local n=${#S_NAMES[@]}
+    local table_start=5
+    local max_rows=$((TERM_ROWS - table_start - 8))  # leave room for preview + footer
+    ((max_rows < 1)) && max_rows=1
+
+    # Calculate visible window
+    local visible_start=0
+    if ((CURSOR >= max_rows)); then
+        visible_start=$((CURSOR - max_rows + 1))
+    fi
+
+    for ((row=0; row<max_rows; row++)); do
+        local i=$((visible_start + row))
+        local line_num=$((table_start + row))
+        move_to "$line_num" 1
+
+        if ((i >= n)); then
+            clear_eol
+            continue
+        fi
+
+        local name="${S_NAMES[$i]}"
+        local st="${S_STATUS[$i]}"
+        local ct="${S_COUNT[$i]}"
+        local cmd="${S_CMD[$i]}"
+        local icon
+        icon=$(cc_status_icon "$st")
+        local color
+        color=$(color_for_status "$st")
+        local label
+        label=$(status_label "$st")
+
+        # Truncate session name
+        local max_name=28
+        local display_name="$name"
+        if ((${#display_name} > max_name)); then
+            display_name="${display_name:0:$((max_name-1))}…"
+        fi
+
+        # Highlight selected row
+        local bg=""
+        if ((i == CURSOR)); then
+            bg="$COLOR_HIGHLIGHT"
+        fi
+
+        local num=$((i + 1))
+        printf '%s%s %2d  %-30s %s%s %-7s%s  %2s  %-10s%s' \
+            "$bg" "$COLOR_TEXT" "$num" "$display_name" \
+            "$color" "$icon" "$label" "$RESET$bg" \
+            "$ct" "$cmd" "$RESET"
+        clear_eol
+    done
+}
+
+render_preview() {
+    local n=${#S_NAMES[@]}
+    local table_start=5
+    local max_rows=$((TERM_ROWS - table_start - 8))
+    ((max_rows < 1)) && max_rows=1
+    local preview_sep_line=$((table_start + max_rows))
+
+    # Separator before preview
+    move_to "$preview_sep_line" 1
+    printf '%s' "$COLOR_MUTED"
+    printf '%.0s─' $(seq 1 "$TERM_COLS")
+    printf '%s' "$RESET"
+
+    local preview_start=$((preview_sep_line + 1))
+
+    if ! $SHOW_PREVIEW || ((n == 0)); then
+        # Clear preview area
+        for ((row=0; row<PREVIEW_LINES+1; row++)); do
+            move_to $((preview_start + row)) 1
+            clear_eol
+        done
+        return
+    fi
+
+    local sel_name="${S_NAMES[$CURSOR]}"
+    local sel_best="${S_BEST_PANE[$CURSOR]}"
+
+    # Preview header
+    move_to "$preview_start" 1
+    printf '%s  Preview [%s]:%s' "$COLOR_MUTED" "$sel_name" "$RESET"
+    clear_eol
+
+    # Get pane content
+    local pane_id="${sel_best:-}"
+    if [[ -z "$pane_id" ]]; then
+        pane_id=$(tmux list-panes -t "$sel_name" -F '#{pane_id}' 2>/dev/null | head -1)
+    fi
+
+    local -a preview_lines=()
+    if [[ -n "$pane_id" ]]; then
+        while IFS= read -r line; do
+            preview_lines+=("$line")
+        done < <(tmux capture-pane -t "$pane_id" -p -J 2>/dev/null | tail -"$PREVIEW_LINES")
+    fi
+
+    for ((row=0; row<PREVIEW_LINES; row++)); do
+        move_to $((preview_start + 1 + row)) 1
+        if ((row < ${#preview_lines[@]})); then
+            local pline="${preview_lines[$row]}"
+            # Truncate to terminal width
+            if ((${#pline} > TERM_COLS - 4)); then
+                pline="${pline:0:$((TERM_COLS - 5))}…"
+            fi
+            printf '%s  %s%s' "$DIM" "$pline" "$RESET"
+        fi
+        clear_eol
+    done
+}
+
+render_footer() {
+    local footer_sep=$((TERM_ROWS - 1))
+    local footer_line=$TERM_ROWS
+
+    move_to "$footer_sep" 1
+    printf '%s' "$COLOR_MUTED"
+    printf '%.0s─' $(seq 1 "$TERM_COLS")
+    printf '%s' "$RESET"
+
+    move_to "$footer_line" 1
+    printf '%s  j/k navigate  Enter switch  w next waiting  p preview  r refresh  q quit%s' \
+        "$COLOR_MUTED" "$RESET"
+    clear_eol
+}
+
+full_render() {
+    render_header
+    render_table
+    render_preview
+    render_footer
+}
+
+# ── Input handling ──────────────────────────────────────────────────────────
+handle_input() {
+    local key=""
+    IFS= read -rsn1 -t "$REFRESH_INTERVAL" key || true
+
+    if [[ -z "$key" ]]; then
+        return 1  # timeout — just refresh
+    fi
+
+    local n=${#S_NAMES[@]}
+    ((n == 0)) && { [[ "$key" == "q" ]] && return 2; return 0; }
+
+    case "$key" in
+        j)
+            ((CURSOR < n - 1)) && ((CURSOR++))
+            ;;
+        k)
+            ((CURSOR > 0)) && ((CURSOR--))
+            ;;
+        g)
+            CURSOR=0
+            ;;
+        G)
+            CURSOR=$((n - 1))
+            ;;
+        w)
+            # Jump to next WAITING session
+            local found=false
+            for ((i=1; i<=n; i++)); do
+                local idx=$(( (CURSOR + i) % n ))
+                if [[ "${S_STATUS[$idx]}" == "WAITING" ]]; then
+                    CURSOR=$idx
+                    found=true
+                    break
+                fi
+            done
+            ;;
+        r)
+            PREV_RENDER=""  # force full redraw
+            ;;
+        p)
+            if $SHOW_PREVIEW; then
+                SHOW_PREVIEW=false
+            else
+                SHOW_PREVIEW=true
+            fi
+            PREV_RENDER=""
+            ;;
+        q)
+            return 2  # exit
+            ;;
+        $'\n'|"")
+            # Enter — switch to session
+            local target="${S_NAMES[$CURSOR]}"
+            local bp="${S_BEST_PANE[$CURSOR]}"
+            cleanup
+            if [[ -n "$bp" ]]; then
+                tmux switch-client -t "$bp" 2>/dev/null || tmux switch-client -t "$target" 2>/dev/null || true
+            else
+                tmux switch-client -t "$target" 2>/dev/null || true
+            fi
+            exit 0
+            ;;
+        $'\e')
+            # Escape sequence — read remaining chars
+            local seq=""
+            IFS= read -rsn1 -t 0.01 seq || true
+            if [[ "$seq" == "[" ]]; then
+                local arrow=""
+                IFS= read -rsn1 -t 0.01 arrow || true
+                case "$arrow" in
+                    A) ((CURSOR > 0)) && ((CURSOR--)) ;;      # Up
+                    B) ((CURSOR < n - 1)) && ((CURSOR++)) ;;  # Down
+                esac
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
+# ── Main ────────────────────────────────────────────────────────────────────
+main() {
+    setup_terminal
+    update_dimensions
+    printf '\e[2J'  # clear screen once at startup
+
+    # Initial cleanup
+    cc_cleanup_stale
+
+    local refresh_counter=0
+    local CLEANUP_INTERVAL=30  # run cleanup every 30 refreshes
+
+    while true; do
+        gather_sessions
+
+        # Clamp cursor
+        local n=${#S_NAMES[@]}
+        if ((n == 0)); then
+            CURSOR=0
+        elif ((CURSOR >= n)); then
+            CURSOR=$((n - 1))
+        fi
+
+        full_render
+
+        handle_input
+        local rc=$?
+        ((rc == 2)) && break
+
+        # Periodic stale cleanup
+        ((refresh_counter++))
+        if ((refresh_counter >= CLEANUP_INTERVAL)); then
+            cc_cleanup_stale
+            refresh_counter=0
+        fi
+    done
+}
+
+main

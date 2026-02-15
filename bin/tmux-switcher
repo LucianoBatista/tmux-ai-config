@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# tmux-switcher — fzf session switcher with Claude Code status icons
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/tmux-cc-status"
+
+current_session=$(tmux display-message -p '#{session_name}')
+
+# Write a helper script for fzf subprocesses to source
+HELPER=$(mktemp)
+trap 'rm -f "$HELPER"' EXIT
+
+cat > "$HELPER" <<'HELPEREOF'
+source "$(dirname "$0")/tmux-cc-status" 2>/dev/null || true
+
+extract_session() {
+    echo "$1" | sed 's/^[^ ]* //' | sed 's/ ([0-9]*)//; s/ \*$//'
+}
+HELPEREOF
+
+# Build session list with status icons
+session_list() {
+    while IFS= read -r session; do
+        [[ -z "$session" ]] && continue
+        local status icon
+        status=$(cc_status_for_session "$session")
+        icon=$(cc_status_icon "$status")
+        local count marker=""
+        count=$(cc_instance_count "$session")
+        [[ "$session" == "$current_session" ]] && marker=" *"
+        if [[ $count -gt 1 ]]; then
+            echo "$icon $session ($count)$marker"
+        else
+            echo "$icon $session$marker"
+        fi
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+}
+
+# Write session list to a temp file for reload
+LIST_FILE=$(mktemp)
+trap 'rm -f "$HELPER" "$LIST_FILE"' EXIT
+
+# Write a reload script
+RELOAD_SCRIPT=$(mktemp)
+trap 'rm -f "$HELPER" "$LIST_FILE" "$RELOAD_SCRIPT"' EXIT
+
+cat > "$RELOAD_SCRIPT" <<EOF
+#!/usr/bin/env bash
+source "$SCRIPT_DIR/tmux-cc-status"
+current_session="$current_session"
+while IFS= read -r session; do
+    [[ -z "\$session" ]] && continue
+    status=\$(cc_status_for_session "\$session")
+    icon=\$(cc_status_icon "\$status")
+    count=\$(cc_instance_count "\$session")
+    marker=""
+    [[ "\$session" == "\$current_session" ]] && marker=" *"
+    if [[ \$count -gt 1 ]]; then
+        echo "\$icon \$session (\$count)\$marker"
+    else
+        echo "\$icon \$session\$marker"
+    fi
+done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+EOF
+chmod +x "$RELOAD_SCRIPT"
+
+# Preview script
+PREVIEW_SCRIPT=$(mktemp)
+trap 'rm -f "$HELPER" "$LIST_FILE" "$RELOAD_SCRIPT" "$PREVIEW_SCRIPT"' EXIT
+
+cat > "$PREVIEW_SCRIPT" <<EOF
+#!/usr/bin/env bash
+source "$SCRIPT_DIR/tmux-cc-status"
+session_name=\$(echo "\$1" | sed 's/^[^ ]* //' | sed 's/ ([0-9]*)//; s/ \*$//')
+best_pane=\$(cc_best_pane "\$session_name")
+if [[ -n "\$best_pane" ]]; then
+    pane_id="\$best_pane"
+else
+    pane_id=\$(tmux list-panes -t "\$session_name" -F '#{pane_id}' 2>/dev/null | head -1)
+fi
+[[ -n "\$pane_id" ]] && tmux capture-pane -t "\$pane_id" -p -J 2>/dev/null | tail -30
+EOF
+chmod +x "$PREVIEW_SCRIPT"
+
+selected=$(session_list | fzf \
+    --ansi \
+    --no-sort \
+    --reverse \
+    --header="enter: switch | ctrl-d: kill session" \
+    --preview="bash $PREVIEW_SCRIPT {}" \
+    --preview-window=right:50%:wrap \
+    --bind="ctrl-d:execute-silent(session=\$(echo {} | sed 's/^[^ ]* //' | sed 's/ ([0-9]*)//; s/ \*$//'); tmux kill-session -t \"\$session\" 2>/dev/null)+reload(bash $RELOAD_SCRIPT)")
+
+[[ -z "$selected" ]] && exit 0
+
+# Extract session name and switch to the most relevant pane
+target=$(echo "$selected" | sed 's/^[^ ]* //' | sed 's/ ([0-9]*)//; s/ \*$//')
+best_pane=$(cc_best_pane "$target")
+if [[ -n "$best_pane" ]]; then
+    tmux switch-client -t "$best_pane"
+else
+    tmux switch-client -t "$target"
+fi
