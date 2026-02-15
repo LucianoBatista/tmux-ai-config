@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# tmux-worktree — fzf TUI for managing git worktrees with tmux integration
+# Keybinding: prefix-w
+
+set -euo pipefail
+
+for cmd in fzf gum; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "Error: $cmd is required but not installed."; exit 1; }
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/tmux-cc-status"
+
+SEARCH_DIRS=(~/Documents/work ~/Documents/code)
+
+# --- Temp scripts with cleanup ---
+RELOAD_SCRIPT=$(mktemp)
+PREVIEW_SCRIPT=$(mktemp)
+CREATE_SCRIPT=$(mktemp)
+REMOVE_SCRIPT=$(mktemp)
+trap 'rm -f "$RELOAD_SCRIPT" "$PREVIEW_SCRIPT" "$CREATE_SCRIPT" "$REMOVE_SCRIPT"' EXIT
+
+# --- Worktree list ---
+# Format: <icon> <session_name_padded>\t<colored_status>\t<path>
+worktree_list() {
+    for base in "${SEARCH_DIRS[@]}"; do
+        [[ -d "$base" ]] || continue
+        while IFS= read -r wt_base; do
+            local project
+            project=$(basename "$wt_base" | sed 's/-worktrees$//')
+            while IFS= read -r wt_path; do
+                local branch session_name status icon st_colored
+                branch=$(basename "$wt_path")
+                session_name="${project}/${branch}"
+                if tmux has-session -t="$session_name" 2>/dev/null; then
+                    status=$(cc_status_for_session "$session_name")
+                    icon=$(cc_status_icon "$status")
+                    case "$status" in
+                        WAITING) st_colored="\033[38;2;235;111;146m${status}\033[0m" ;;
+                        WORKING) st_colored="\033[38;2;246;193;119m${status}\033[0m" ;;
+                        IDLE)    st_colored="\033[38;2;49;116;143m${status}\033[0m" ;;
+                        *)       st_colored="\033[38;2;144;140;170m${status}\033[0m" ;;
+                    esac
+                else
+                    icon=$(cc_status_icon "SHELL")
+                    st_colored="\033[38;2;110;106;134mno session\033[0m"
+                fi
+                printf "%s %-30s\t%b\t%s\n" "$icon" "$session_name" "$st_colored" "$wt_path"
+            done < <(find "$wt_base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+        done < <(find "$base" -maxdepth 1 -name '*-worktrees' -type d 2>/dev/null | sort)
+    done
+}
+
+# --- Reload script (same logic, standalone for fzf subprocess) ---
+cat > "$RELOAD_SCRIPT" <<EOF
+#!/usr/bin/env bash
+source "$SCRIPT_DIR/tmux-cc-status"
+SEARCH_DIRS=(~/Documents/work ~/Documents/code)
+for base in "\${SEARCH_DIRS[@]}"; do
+    [[ -d "\$base" ]] || continue
+    while IFS= read -r wt_base; do
+        project=\$(basename "\$wt_base" | sed 's/-worktrees\$//')
+        while IFS= read -r wt_path; do
+            branch=\$(basename "\$wt_path")
+            session_name="\${project}/\${branch}"
+            if tmux has-session -t="\$session_name" 2>/dev/null; then
+                status=\$(cc_status_for_session "\$session_name")
+                icon=\$(cc_status_icon "\$status")
+                case "\$status" in
+                    WAITING) st_colored="\033[38;2;235;111;146m\${status}\033[0m" ;;
+                    WORKING) st_colored="\033[38;2;246;193;119m\${status}\033[0m" ;;
+                    IDLE)    st_colored="\033[38;2;49;116;143m\${status}\033[0m" ;;
+                    *)       st_colored="\033[38;2;144;140;170m\${status}\033[0m" ;;
+                esac
+            else
+                icon=\$(cc_status_icon "SHELL")
+                st_colored="\033[38;2;110;106;134mno session\033[0m"
+            fi
+            printf "%s %-30s\t%b\t%s\n" "\$icon" "\$session_name" "\$st_colored" "\$wt_path"
+        done < <(find "\$wt_base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+    done < <(find "\$base" -maxdepth 1 -name '*-worktrees' -type d 2>/dev/null | sort)
+done
+EOF
+chmod +x "$RELOAD_SCRIPT"
+
+# --- Preview script ---
+cat > "$PREVIEW_SCRIPT" <<EOF
+#!/usr/bin/env bash
+source "$SCRIPT_DIR/tmux-cc-status"
+line="\$1"
+session_name=\$(echo "\$line" | awk '{print \$2}')
+wt_path=\$(echo "\$line" | awk -F'\t' '{print \$NF}')
+
+if tmux has-session -t="\$session_name" 2>/dev/null; then
+    best_pane=\$(cc_best_pane "\$session_name")
+    if [[ -n "\$best_pane" ]]; then
+        pane_id="\$best_pane"
+    else
+        pane_id=\$(tmux list-panes -t "\$session_name" -F '#{pane_id}' 2>/dev/null | head -1)
+    fi
+    [[ -n "\$pane_id" ]] && tmux capture-pane -t "\$pane_id" -p -J 2>/dev/null | tail -30
+else
+    if [[ -d "\$wt_path" ]]; then
+        echo "  No tmux session"
+        echo ""
+        echo "  git log:"
+        git -C "\$wt_path" log --oneline -10 2>/dev/null | sed 's/^/  /'
+        echo ""
+        echo "  git status:"
+        git -C "\$wt_path" status --short 2>/dev/null | sed 's/^/  /'
+    fi
+fi
+EOF
+chmod +x "$PREVIEW_SCRIPT"
+
+# --- Create script ---
+cat > "$CREATE_SCRIPT" <<EOF
+#!/usr/bin/env bash
+SEARCH_DIRS=(~/Documents/work ~/Documents/code)
+projects=\$(
+    for base in "\${SEARCH_DIRS[@]}"; do
+        [[ -d "\$base" ]] || continue
+        for dir in "\$base"/*/; do
+            [[ -d "\$dir/.git" ]] && basename "\$dir"
+        done
+    done | sort -u
+)
+
+[[ -z "\$projects" ]] && { echo "No git repos found"; sleep 1; exit 0; }
+
+project=\$(echo "\$projects" | gum filter --placeholder "Select project...")
+[[ -z "\$project" ]] && exit 0
+
+while true; do
+    branch=\$(gum input --placeholder "Branch name (no '/' allowed)...")
+    [[ -z "\$branch" ]] && exit 0
+    if [[ "\$branch" == */* ]]; then
+        gum style --foreground 196 "Branch name cannot contain '/'. Use '-' instead."
+        continue
+    fi
+    break
+done
+
+# Find repo path for base branch listing
+repo_path=""
+for base in "\${SEARCH_DIRS[@]}"; do
+    if [[ -d "\$base/\$project" ]]; then
+        repo_path="\$base/\$project"
+        break
+    fi
+done
+
+# Base branch picker
+base_args=""
+if [[ -n "\$repo_path" ]]; then
+    branches=\$(git -C "\$repo_path" branch --format='%(refname:short)' 2>/dev/null | sort)
+    if [[ -n "\$branches" ]]; then
+        # Prioritize main/master at top
+        sorted_branches=\$(
+            echo "\$branches" | grep -E '^(main|master)\$' || true
+            echo "\$branches" | grep -vE '^(main|master)\$' || true
+        )
+        base_branch=\$(echo "\$sorted_branches" | gum filter --placeholder "Base branch (ESC for HEAD)...") || true
+        if [[ -n "\$base_branch" ]]; then
+            base_args="--base \$base_branch"
+        fi
+    fi
+fi
+
+if gum confirm "Start Claude Code?"; then
+    TMUX= "$SCRIPT_DIR/wt" "\$project" "\$branch" \$base_args
+else
+    TMUX= "$SCRIPT_DIR/wt" "\$project" "\$branch" --no-cc \$base_args
+fi
+EOF
+chmod +x "$CREATE_SCRIPT"
+
+# --- Remove script ---
+cat > "$REMOVE_SCRIPT" <<EOF
+#!/usr/bin/env bash
+line="\$1"
+session_name=\$(echo "\$line" | awk '{print \$2}')
+project="\${session_name%%/*}"
+branch="\${session_name#*/}"
+
+if gum confirm "Remove \$session_name?"; then
+    "$SCRIPT_DIR/wt" rm "\$project" "\$branch"
+    sleep 0.5
+fi
+EOF
+chmod +x "$REMOVE_SCRIPT"
+
+# --- Main fzf ---
+selected=$(worktree_list | fzf \
+    --ansi \
+    --no-sort \
+    --reverse \
+    --delimiter=$'\t' \
+    --with-nth=1,2 \
+    --header="enter: switch | ctrl-n: new | ctrl-d: remove" \
+    --color="bg:#191724,fg:#e0def4,header:#908caa,hl:#eb6f92,hl+:#eb6f92,info:#908caa,prompt:#c4a7e7,pointer:#c4a7e7,marker:#f6c177,spinner:#c4a7e7,border:#26233a,bg+:#26233a,fg+:#e0def4" \
+    --preview="bash $PREVIEW_SCRIPT {}" \
+    --preview-window=right:50%:wrap \
+    --bind="ctrl-n:execute(bash $CREATE_SCRIPT)+reload(bash $RELOAD_SCRIPT)" \
+    --bind="ctrl-d:execute(bash $REMOVE_SCRIPT {})+reload(bash $RELOAD_SCRIPT)" \
+    || true)
+
+[[ -z "$selected" ]] && exit 0
+
+# Extract session name and worktree path
+session_name=$(echo "$selected" | awk '{print $2}')
+wt_path=$(echo "$selected" | awk -F$'\t' '{print $NF}')
+
+# Create session if it doesn't exist yet
+if ! tmux has-session -t="$session_name" 2>/dev/null; then
+    tmux new-session -ds "$session_name" -c "$wt_path"
+fi
+
+# Switch to best pane (highest priority CC status)
+best_pane=$(cc_best_pane "$session_name")
+if [[ -n "$best_pane" ]]; then
+    tmux switch-client -t "$best_pane"
+else
+    tmux switch-client -t "$session_name"
+fi

@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# wt — Worktree + tmux session lifecycle manager
+#
+# Usage:
+#   wt <project> <branch>                  Create worktree + tmux session + start CC
+#   wt <project> <branch> --base <ref>     Branch off a specific ref instead of HEAD
+#   wt <project> <branch> --no-cc          Without Claude Code
+#   wt rm <project> <branch>         Remove worktree + kill session
+#   wt ls                            List all worktrees with session status
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/tmux-cc-status"
+
+SEARCH_DIRS=(~/Documents/work ~/Documents/code)
+
+find_repo() {
+    local project="$1"
+    for base in "${SEARCH_DIRS[@]}"; do
+        if [[ -d "$base/$project" ]]; then
+            echo "$base/$project"
+            return
+        fi
+    done
+    return 1
+}
+
+cmd_create() {
+    local project="$1"
+    local branch="$2"
+    shift 2
+    local start_cc=true
+    local base_ref=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-cc) start_cc=false; shift ;;
+            --base) base_ref="$2"; shift 2 ;;
+            *) echo "Error: unknown option '$1'"; exit 1 ;;
+        esac
+    done
+
+    if [[ "$branch" == */* ]]; then
+        echo "Error: branch name cannot contain '/'. Use '-' instead (e.g., 'feat-auth')."
+        exit 1
+    fi
+
+    local repo_path
+    repo_path=$(find_repo "$project") || { echo "Error: repo '$project' not found in ${SEARCH_DIRS[*]}"; exit 1; }
+
+    local wt_base
+    wt_base="$(dirname "$repo_path")/${project}-worktrees"
+    local wt_path="$wt_base/$branch"
+    local session_name="${project}/${branch}"
+
+    # Create worktree if it doesn't exist
+    if [[ ! -d "$wt_path" ]]; then
+        mkdir -p "$wt_base"
+        echo "Creating worktree at $wt_path..."
+        if git -C "$repo_path" worktree add "$wt_path" "$branch" 2>/dev/null; then
+            :  # existing branch checked out
+        elif [[ -n "$base_ref" ]]; then
+            git -C "$repo_path" worktree add -b "$branch" "$wt_path" "$base_ref"
+        else
+            git -C "$repo_path" worktree add -b "$branch" "$wt_path"
+        fi || { echo "Error: failed to create worktree for branch '$branch'"; exit 1; }
+    else
+        echo "Worktree already exists at $wt_path"
+    fi
+
+    # Create tmux session if it doesn't exist
+    if ! tmux has-session -t="$session_name" 2>/dev/null; then
+        echo "Creating session '$session_name'..."
+        tmux new-session -ds "$session_name" -c "$wt_path"
+    else
+        echo "Session '$session_name' already exists"
+    fi
+
+    # Start Claude Code if requested
+    if $start_cc; then
+        tmux send-keys -t "$session_name" "claude" Enter
+    fi
+
+    # Switch to session if inside tmux
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "$session_name"
+    else
+        echo "Session '$session_name' ready. Attach with: tmux attach -t '$session_name'"
+    fi
+}
+
+cmd_remove() {
+    local project="$1"
+    local branch="$2"
+    local session_name="${project}/${branch}"
+
+    local repo_path
+    repo_path=$(find_repo "$project") || { echo "Error: repo '$project' not found"; exit 1; }
+
+    local wt_base
+    wt_base="$(dirname "$repo_path")/${project}-worktrees"
+    local wt_path="$wt_base/$branch"
+
+    # Kill session
+    if tmux has-session -t="$session_name" 2>/dev/null; then
+        echo "Killing session '$session_name'..."
+        tmux kill-session -t "$session_name"
+    fi
+
+    # Remove worktree
+    if [[ -d "$wt_path" ]]; then
+        echo "Removing worktree at $wt_path..."
+        git -C "$repo_path" worktree remove "$wt_path" --force
+    else
+        echo "No worktree at $wt_path"
+    fi
+
+    # Clean up empty worktrees dir
+    if [[ -d "$wt_base" ]] && [[ -z "$(ls -A "$wt_base")" ]]; then
+        rmdir "$wt_base"
+    fi
+
+    echo "Done."
+}
+
+cmd_list() {
+    echo "Worktrees:"
+    echo ""
+
+    local output
+    output=$(
+        for base in "${SEARCH_DIRS[@]}"; do
+            [[ -d "$base" ]] || continue
+            while IFS= read -r wt_base; do
+                local project
+                project=$(basename "$wt_base" | sed 's/-worktrees$//')
+                while IFS= read -r wt_path; do
+                    local branch session_name status icon session_info
+                    branch=$(basename "$wt_path")
+                    session_name="${project}/${branch}"
+
+                    if tmux has-session -t="$session_name" 2>/dev/null; then
+                        status=$(cc_status_for_session "$session_name")
+                        icon=$(cc_status_icon "$status")
+                        session_info="$icon $status"
+                    else
+                        session_info="  no session"
+                    fi
+
+                    printf "  %-30s %s\n" "$session_name" "$session_info"
+                done < <(find "$wt_base" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+            done < <(find "$base" -maxdepth 1 -name '*-worktrees' -type d 2>/dev/null | sort)
+        done
+    )
+
+    if [[ -n "$output" ]]; then
+        echo "$output"
+    else
+        echo "  (none)"
+    fi
+}
+
+# --- Main ---
+case "${1:-}" in
+    rm|remove)
+        [[ $# -lt 3 ]] && { echo "Usage: wt rm <project> <branch>"; exit 1; }
+        cmd_remove "$2" "$3"
+        ;;
+    ls|list)
+        cmd_list
+        ;;
+    "")
+        echo "Usage:"
+        echo "  wt <project> <branch> [options]  Create worktree + session + Claude Code"
+        echo ""
+        echo "Options:"
+        echo "  --no-cc                          Don't start Claude Code"
+        echo "  --base <ref>                     Base branch for new worktree (default: HEAD)"
+        echo ""
+        echo "  wt rm <project> <branch>         Remove worktree + kill session"
+        echo "  wt ls                            List worktrees with session status"
+        ;;
+    *)
+        [[ $# -lt 2 ]] && { echo "Usage: wt <project> <branch> [--base <ref>] [--no-cc]"; exit 1; }
+        cmd_create "$@"
+        ;;
+esac

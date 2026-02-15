@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# tmux-sessionizer — Enhanced project picker with worktree support
+
+if [[ $# -eq 1 ]]; then
+    selected=$1
+else
+    # Gather project directories and worktree subdirectories
+    dirs=()
+    for base in ~/Documents/code ~/Documents/boot-dot-dev ~/Documents/work; do
+        [[ -d "$base" ]] && dirs+=("$base")
+    done
+
+    selected=$(
+    {
+        # Standard project directories
+        find "${dirs[@]}" -mindepth 1 -maxdepth 1 -type d 2>/dev/null
+
+        # Worktree directories (project-worktrees/branch)
+        for base in "${dirs[@]}"; do
+            find "$base" -maxdepth 1 -name '*-worktrees' -type d 2>/dev/null | while read -r wt_parent; do
+                find "$wt_parent" -mindepth 1 -maxdepth 1 -type d 2>/dev/null
+            done
+        done
+    } | sort -u | fzf)
+fi
+
+if [[ -z "$selected" ]]; then
+    exit 0
+fi
+
+# Generate session name: for worktrees use project/branch, otherwise basename
+if [[ "$selected" =~ -worktrees/ ]]; then
+    # Extract project name and branch from path like .../project-worktrees/branch
+    branch=$(basename "$selected")
+    project=$(basename "$(dirname "$selected")" | sed 's/-worktrees$//')
+    selected_name="${project}/${branch}"
+else
+    selected_name=$(basename "$selected" | tr . _)
+fi
+
+tmux_running=$(pgrep tmux)
+
+if [[ -z $TMUX ]] && [[ -z $tmux_running ]]; then
+    tmux new-session -s "$selected_name" -c "$selected"
+    exit 0
+fi
+
+if ! tmux has-session -t="$selected_name" 2>/dev/null; then
+    tmux new-session -ds "$selected_name" -c "$selected"
+fi
+
+tmux switch-client -t "$selected_name"
