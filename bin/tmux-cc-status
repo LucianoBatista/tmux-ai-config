@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# tmux-cc-status — Core detection library for Claude Code state per session
+# Source this file, then call: cc_status_for_session <session_name>
+# Reads @claude_status tmux pane options (set by tmux-cc-notify hook)
+# and aggregates: WAITING > WORKING > IDLE > SHELL
+
+cc_status_for_session() {
+    local session="$1"
+    [[ -z "$session" ]] && echo "SHELL" && return
+
+    local has_waiting=false has_working=false has_idle=false
+    while IFS= read -r pane_id; do
+        local st
+        st=$(tmux show-option -p -t "$pane_id" -qv '@claude_status' 2>/dev/null)
+        case "$st" in
+            WAITING) has_waiting=true ;;
+            WORKING) has_working=true ;;
+            IDLE)    has_idle=true ;;
+        esac
+    done < <(tmux list-panes -s -t "$session" -F '#{pane_id}' 2>/dev/null)
+
+    if $has_waiting; then echo "WAITING"
+    elif $has_working; then echo "WORKING"
+    elif $has_idle; then echo "IDLE"
+    else echo "SHELL"
+    fi
+}
+
+cc_instance_count() {
+    local session="$1" count=0
+    while IFS= read -r pane_id; do
+        local st
+        st=$(tmux show-option -p -t "$pane_id" -qv '@claude_status' 2>/dev/null)
+        [[ -n "$st" ]] && ((count++))
+    done < <(tmux list-panes -s -t "$session" -F '#{pane_id}' 2>/dev/null)
+    echo "$count"
+}
+
+# Returns the pane_id with the highest-priority status in a session
+# Priority: WAITING > WORKING > IDLE. Returns empty if no Claude panes.
+cc_best_pane() {
+    local session="$1"
+    [[ -z "$session" ]] && return
+
+    local waiting_pane="" working_pane="" idle_pane=""
+    while IFS= read -r pane_id; do
+        local st
+        st=$(tmux show-option -p -t "$pane_id" -qv '@claude_status' 2>/dev/null)
+        case "$st" in
+            WAITING) [[ -z "$waiting_pane" ]] && waiting_pane="$pane_id" ;;
+            WORKING) [[ -z "$working_pane" ]] && working_pane="$pane_id" ;;
+            IDLE)    [[ -z "$idle_pane" ]]    && idle_pane="$pane_id" ;;
+        esac
+    done < <(tmux list-panes -s -t "$session" -F '#{pane_id}' 2>/dev/null)
+
+    if [[ -n "$waiting_pane" ]]; then echo "$waiting_pane"
+    elif [[ -n "$working_pane" ]]; then echo "$working_pane"
+    elif [[ -n "$idle_pane" ]]; then echo "$idle_pane"
+    fi
+}
+
+cc_status_icon() {
+    case "$1" in
+        WAITING) printf '\uf0f3' ;;  # nf-fa-bell
+        WORKING) printf '\uf013' ;;  # nf-fa-cog
+        IDLE)    printf '\uf00c' ;;  # nf-fa-check
+        SHELL)   printf '\uf120' ;;  # nf-fa-terminal
+        *)       printf '\uf128' ;;  # nf-fa-question
+    esac
+}
+
+# Unset @claude_status on panes where claude is no longer running
+cc_cleanup_stale() {
+    while read -r pane_id pane_pid; do
+        local st
+        st=$(tmux show-option -p -t "$pane_id" -qv '@claude_status' 2>/dev/null)
+        [[ -z "$st" ]] && continue
+        if ! pgrep -P "$pane_pid" -af claude >/dev/null 2>&1; then
+            tmux set-option -p -t "$pane_id" -u '@claude_status' 2>/dev/null || true
+        fi
+    done < <(tmux list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null)
+}

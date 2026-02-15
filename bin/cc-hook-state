@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# cc-hook-state — Claude Code hook handler for tmux status integration
+# Called by Claude Code hooks on lifecycle events. Reads JSON from stdin,
+# writes state to /tmp/cc-state/<session_id>.json for tmux to read.
+set -euo pipefail
+
+command -v jq >/dev/null || exit 0
+
+STATE_DIR="/tmp/cc-state"
+mkdir -p "$STATE_DIR"
+
+EVENT="${1:-}"
+[[ -z "$EVENT" ]] && exit 0
+
+# Read JSON from stdin
+INPUT=$(cat)
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+[[ -z "$SESSION_ID" ]] && exit 0
+
+STATE_FILE="$STATE_DIR/$SESSION_ID.json"
+
+# Get cwd: preserve original from state file, fall back to stdin
+get_cwd() {
+    local cwd=""
+    if [[ -f "$STATE_FILE" ]]; then
+        cwd=$(jq -r '.cwd // empty' "$STATE_FILE" 2>/dev/null)
+    fi
+    if [[ -z "$cwd" ]]; then
+        cwd=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
+    fi
+    echo "$cwd"
+}
+
+# Write state atomically (temp file + mv)
+write_state() {
+    local status="$1" cwd="$2"
+    jq -n --arg s "$status" --arg c "$cwd" --argjson t "$(date +%s)" \
+        '{status:$s,cwd:$c,ts:$t}' > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+case "$EVENT" in
+    SessionStart)
+        # Use cwd from stdin (initial working directory)
+        cwd=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)
+        write_state "IDLE" "$cwd"
+        ;;
+    SessionEnd)
+        rm -f "$STATE_FILE" "$STATE_FILE.tmp"
+        ;;
+    Notification)
+        # Only called for permission_prompt (filtered by matcher in settings)
+        write_state "WAITING" "$(get_cwd)"
+        ;;
+    Stop)
+        write_state "IDLE" "$(get_cwd)"
+        ;;
+    UserPromptSubmit|PreToolUse)
+        write_state "WORKING" "$(get_cwd)"
+        ;;
+esac
