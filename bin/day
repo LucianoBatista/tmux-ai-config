@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# day — Day start/end bootstrap
+#
+# Usage:
+#   day start    Show sprint, list worktrees, offer to spin up sessions
+#   day end      List sessions, offer to kill all except current
+#   day sprint   Quick-view sprint.md
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SPRINT_FILE=$("$SCRIPT_DIR/current-sprint")
+
+source "$SCRIPT_DIR/tmux-cc-status"
+
+cmd_sprint() {
+    if [[ -f "$SPRINT_FILE" ]]; then
+        bat --style=plain --paging=never "$SPRINT_FILE"
+    else
+        echo "No sprint.md found at $SPRINT_FILE"
+        echo "Create one to get started."
+    fi
+}
+
+cmd_start() {
+    echo "=== Good morning! ==="
+    echo ""
+
+    # Show sprint
+    echo "--- Sprint ---"
+    cmd_sprint
+    echo ""
+
+    # List active sessions
+    echo "--- Active Sessions ---"
+    while IFS= read -r session; do
+        [[ -z "$session" ]] && continue
+        local status icon
+        status=$(cc_status_for_session "$session")
+        icon=$(cc_status_icon "$status")
+        echo "  $icon $session ($status)"
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    echo ""
+
+    # List worktrees
+    echo "--- Worktrees ---"
+    "$SCRIPT_DIR/wt" ls 2>/dev/null | tail -n +3 || echo "  (none)"
+    echo ""
+
+    # Offer to open sprint file for editing
+    if command -v gum &>/dev/null; then
+        if gum confirm "Edit sprint.md?"; then
+            ${EDITOR:-vim} "$SPRINT_FILE"
+        fi
+    fi
+}
+
+cmd_end() {
+    local current_session
+    current_session=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "")
+
+    echo "=== End of day ==="
+    echo ""
+    echo "--- Active Sessions ---"
+
+    local sessions=()
+    while IFS= read -r session; do
+        [[ -z "$session" ]] && continue
+        local status icon
+        status=$(cc_status_for_session "$session")
+        icon=$(cc_status_icon "$status")
+        local marker=""
+        [[ "$session" == "$current_session" ]] && marker=" (current)"
+        echo "  $icon $session ($status)$marker"
+        [[ "$session" != "$current_session" ]] && sessions+=("$session")
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    echo ""
+
+    if [[ ${#sessions[@]} -eq 0 ]]; then
+        echo "No other sessions to clean up."
+        return
+    fi
+
+    if command -v gum &>/dev/null; then
+        if gum confirm "Kill all sessions except '$current_session'?"; then
+            for session in "${sessions[@]}"; do
+                echo "  Killing $session..."
+                tmux kill-session -t "$session" 2>/dev/null || true
+            done
+            echo "Done. Only '$current_session' remains."
+        else
+            echo "No sessions killed."
+        fi
+    else
+        echo "Install gum for interactive prompts, or kill sessions manually."
+    fi
+}
+
+case "${1:-}" in
+    start)   cmd_start ;;
+    end)     cmd_end ;;
+    sprint)  cmd_sprint ;;
+    *)
+        echo "Usage:"
+        echo "  day start    Morning bootstrap: sprint + sessions + worktrees"
+        echo "  day end      Evening cleanup: kill sessions"
+        echo "  day sprint   Quick-view sprint.md"
+        ;;
+esac

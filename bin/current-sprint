@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+SPRINT_DIR="$HOME/Documents/work/ai-sprints"
+ls "$SPRINT_DIR"/sprint-*.md 2>/dev/null | sort -t- -k2 -n | tail -1
