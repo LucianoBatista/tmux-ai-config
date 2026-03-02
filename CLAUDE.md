@@ -64,8 +64,8 @@ tmux-switcher / tmux-dashboard / tmux-pending-count → reads via tmux-cc-status
 
 - **`day start`** — Morning bootstrap: shows sprint, lists sessions/worktrees, offers to edit sprint.
 - **`day end`** — Cleanup: lists sessions, offers to kill all except current.
-- **`edit-sprint`** — Opens latest `~/Documents/work/ai-sprints/sprint-N.md` in neovim.
-- **`current-sprint`** — Prints path to latest sprint file.
+- **`edit-sprint`** — Opens latest `~/Documents/work/ai-sprints/sprints/cycle-N.md` in neovim.
+- **`current-sprint`** — Prints path to latest cycle file.
 
 ## Tmux Keybindings (from tmux-workflow.conf)
 

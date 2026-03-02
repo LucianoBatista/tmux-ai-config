@@ -117,7 +117,7 @@ Configure Claude Code to report lifecycle events to `tmux-cc-notify`. Add to `~/
 ## 6. Create the Sprint Directory
 
 ```bash
-mkdir -p ~/Documents/work/ai-sprints
+mkdir -p ~/Documents/work/ai-sprints/sprints
 ```
 
 ## Notes
